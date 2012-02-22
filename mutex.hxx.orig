@@ -1,0 +1,10 @@
+#include <pthread.h>
+class mutex
+{
+pthread_mutex_t m;
+public:
+mutex() { pthread_mutex_init(&m,NULL); }
+void lock() { pthread_mutex_lock(&m); }
+void unlock() { pthread_mutex_unlock(&m); }
+~mutex() {pthread_mutex_destroy(&m); }
+};

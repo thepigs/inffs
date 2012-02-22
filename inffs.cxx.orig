@@ -1,0 +1,332 @@
+#include "inffs.hxx"
+
+static string root("");
+static folder filesystem(0,root);
+static mutex filesystem_lock;
+
+static
+void get_attr(entry *e, struct stat *stbuf)
+{
+    memcpy(stbuf,&e->stbuf,sizeof(struct stat));
+}
+static
+int fs_getattr(const char *path, struct stat *stbuf)
+{
+    string sp(path);
+    entry* e=filesystem.find_path(sp);
+    if (e==0)
+        return -ENOENT;
+    get_attr(e,stbuf);
+    return 0;
+}
+static
+int fs_chmod (const char *path, mode_t mode)
+{
+    string sp(path);
+    entry* e=filesystem.find_path(sp);
+    if (e==0)
+        return -ENOENT;
+    e->chmod(mode);
+    return 0;
+}
+static
+int fs_truncate (const char * path, off_t ofs)
+{
+    string sp(path);
+    entry* e=filesystem.find_path(sp);
+    if (e==0)
+        return -ENOENT;
+    file* f=static_cast<file*>(e);
+    if (ofs==0) {
+        f->data.clear();
+        f->stbuf.st_size=0;
+    } else {
+        off_t target = ofs & ~(PAGE_SIZE-1);
+        file_data_t::iterator i = f->seek_forward(ofs);
+        if (i==f->data.end())
+            f->data.insert(i,file_data(target,ofs-target));
+        else
+        {
+            if (i->ofs==target) {
+                i->len=ofs-i->ofs;
+            }
+            else if (target<i->ofs) {
+                i->ofs=target;
+                i->len=ofs-i->ofs;
+            }
+            while (++i!=f->data.end())
+                f->data.erase(i);
+        }
+    }
+    file_data& l =f->data.back();
+    f->stbuf.st_size=l.ofs+l.len;
+    f->stbuf.st_mtime=time(NULL);
+    return 0;
+}
+
+static
+int fs_utimens (const char * path, const struct timespec tv[2])
+{
+    string sp(path);
+    entry* e=filesystem.find_path(sp);
+    if (e==0)
+        return -ENOENT;
+    return 0;
+}
+static
+int fs_chown (const char *path, uid_t uid, gid_t gid) {
+    string sp(path);
+    entry* e=filesystem.find_path(sp);
+    if (e==0)
+        return -ENOENT;
+    e->stbuf.st_uid=uid;
+    e->stbuf.st_gid=gid;
+
+    return 0;
+}
+
+
+static
+int fs_write(const char * f, const char *buf, size_t len, off_t ofs,
+             struct fuse_file_info *fi) {
+    file* e = (file*)fi->fh;
+
+    file_data_t::iterator i=e->seek_backward(ofs);
+    size_t total=len;
+    while (len>0)
+    {
+        off_t target = ofs & ~(PAGE_SIZE-1);
+
+        bool insert=false;
+        if (i==e->data.end()) {
+            insert=true;
+        } else if (target>i->ofs) {
+            ++i;
+            insert = true;
+        } else if (target<i->ofs) {
+            insert = true;
+        }
+        if (insert)
+            i=e->data.insert(i,file_data(target,0));
+
+        size_t to_ofs=ofs-target;
+        size_t to_write = min(PAGE_SIZE-to_ofs,len);
+
+        memcpy(i->data+to_ofs,buf,to_write);
+        if (i->len<to_ofs+to_write)
+            i->len=to_ofs+to_write;
+        len-=to_write;
+        buf+=to_write;
+        ofs+=to_write;
+        i++;
+    }
+    file_data& l =e->data.back();
+    e->stbuf.st_size=l.ofs+l.len;
+    e->stbuf.st_mtime=time(NULL);
+    return total;
+}
+
+static
+int fs_read(const char * f, char *buf, size_t len, off_t ofs,
+            struct fuse_file_info *fi) {
+    file* e = (file*)fi->fh;
+    //string sf(f);
+    //file* e=static_cast<file*>(filesystem.find_path(sf));
+    //if (e==0)
+    //  return -ENOENT;
+
+    file_data_t::iterator i = e->seek_forward(ofs);
+
+    size_t total = 0;
+    while (len>0)
+    {
+        if (i==e->data.end())
+            return total;
+        size_t to_read;
+        if (ofs<i->ofs) {
+            to_read=min(len,(size_t)(i->ofs-ofs));
+            memset(buf,FILL_CHAR,to_read);
+        } else if (ofs>=i->ofs) {
+            to_read=min(len,(size_t)(i->ofs+i->len-ofs));
+            memcpy(buf,i->data+ofs-i->ofs,to_read);
+            i++;
+        }
+        total+=to_read;
+        len-=to_read;
+        ofs+=to_read;
+        buf+=to_read;
+    }
+    e->stbuf.st_atime=time(NULL);
+    return total;
+}
+
+static
+int fs_open(const char *f, struct fuse_file_info *fi)
+{
+    string sf(f);
+    file* e=static_cast<file*>(filesystem.find_path(sf));
+    if (e==0)
+        return -ENOENT;
+    fi->fh=(uint64_t)e;
+    return 0;
+}
+
+static
+int fs_mkdir(const char *path, mode_t mode)
+{
+    string sf(path);
+    int idx = sf.find_last_of('/');
+    string part  = sf.substr(0,idx);
+    folder* e=static_cast<folder*>(filesystem.find_path(part));
+    if (e==0)
+        return -ENOENT;
+    string part2 = sf.substr(idx+1);
+    folder* af = new folder(e,part2);
+    af->stbuf.st_ctime=af->stbuf.st_mtime=time(NULL);
+    af->chmod(mode);
+    e->add(af);
+    return 0;
+}
+
+static
+int fs_create(const char *f, mode_t m, struct fuse_file_info * fi)
+{
+    string sf(f);
+    int idx = sf.find_last_of('/');
+    string part  = sf.substr(0,idx);
+    folder* e=static_cast<folder*>(filesystem.find_path(part));
+    if (e==0)
+        return -ENOENT;
+    string part2 = sf.substr(idx+1);
+    file* af = new file(e, part2);
+    af->stbuf.st_ctime=af->stbuf.st_mtime=time(NULL);
+    af->chmod(m);
+    fuse_context* ctx = fuse_get_context();
+    af->stbuf.st_uid=ctx->uid;
+    af->stbuf.st_gid=ctx->gid;
+    e->add(af);
+    fi->fh=(uint64_t)af;
+    return 0;
+}
+
+static
+int fs_close(const char* f)
+{
+//	files.erase(string(f));
+    return 0;
+}
+static
+int fs_readdir(const char *path, void * buf, fuse_fill_dir_t filler, off_t ofs,
+               struct fuse_file_info *fi)
+{
+    string sp(path);
+    entry* e=filesystem.find_path(sp);
+    if (e==0)
+        return -ENOENT;
+    folder* f = static_cast<folder*>(e);
+    filler(buf, ".", NULL, 0);
+    filler(buf, "..", NULL, 0);
+
+    for (vector<entry*>::iterator i=f->entries.begin();i!=f->entries.end();i++)
+    {
+        //struct stat* stbuf = (struct stat*)malloc(sizeof(struct stat));
+        //get_attr(*i,stbuf);
+        filler(buf,(*i)->name().c_str(),&(*i)->stbuf,0);
+    }
+    return 0;
+}
+
+static
+int fs_unlink(const char * path)
+{
+    try
+    {
+        {
+            lock l(fs_lock);
+            string sp(path);
+            entry* e=filesystem.find_path(sp);
+            if (e==0)
+                return -ENOENT;
+            if (!e->is_file())
+                return -EISDIR;
+
+            e->parent()->remove(e);
+        }
+        {
+            lock l(e.file_lock);
+            e->unlinked = true;
+        }
+    } catch (int err)
+	{ return err; }
+        return 0;
+}
+int fs_rmdir(const char * path)
+{
+    string sp(path);
+    entry* e=filesystem.find_path(sp);
+    if (e==0)
+        return -ENOENT;
+    if (!e->is_folder())
+        return -ENOTDIR;
+    if (e->stbuff.st_nlink>2)
+        return -ENOTEMPTY;
+    e->parent()->remove(e);
+    return 0;
+}
+
+
+/** Create a symbolic link */
+//        int (*symlink) (const char *, const char *);
+
+int fs_rename(const char * path,const char* npath)
+{
+    string sp(path);
+    try {
+        entry* e=filesystem.find_path(sp);
+        if (e==0)
+            return -ENOENT;
+        if (!e->is_folder())
+            return -ENOTDIR;
+        e->set_name(npath);
+        return 0;
+    } catch (int i)
+    {
+        return i;
+    }
+}
+
+
+#ifdef TEST
+int main()
+{
+    string s("/");
+    entry* e=filesystem.find_path(s);
+    e.push_back(file("test"));
+}
+#endif
+
+
+
+int main(int argc, char *argv[])
+{
+    struct fuse_operations fs_oper;
+    memset(&fs_oper,0,sizeof(fs_oper));
+    fs_oper.getattr    = fs_getattr;
+    fs_oper.readdir    = fs_readdir;
+    fs_oper.open     = fs_open;
+    fs_oper.read     = fs_read;
+    fs_oper.write    = fs_write;
+    fs_oper.create   = fs_create;
+    fs_oper.chmod = fs_chmod;
+    fs_oper.chown = fs_chown;
+    fs_oper.utimens = fs_utimens;
+    fs_oper.truncate = fs_truncate;
+    fs_oper.mkdir = fs_mkdir;
+    fs_oper.unlink = fs_unlink;
+    fs_oper.rmdir = fs_rmdir;
+    fs_oper.rename = fs_rename;
+
+//	fs_oper.close=fs_close;
+    return fuse_main(argc, argv, &fs_oper,NULL);
+}
+
