@@ -289,15 +289,19 @@ int fs_unlink(const char * path)
     {
             wrlock l(fs_lock);
             string sp(path);
-            file* e=filesystem.find_file(sp);
+            entry* e=filesystem.find_entry(sp);
+	    if (typeid(*e)==typeid(folder))
+		return -EISDIR;
             e->parent()->remove(e);
-	    bool deleteme = false;           
+	    bool deleteme = true;       
+	    if (typeid(*e)==typeid(file))
 	    {
+		file* f = static_cast<file*>(e);
 	    	lock fl(e->lock);
-	            e->unlinked = true;
-		    if (e->open_count==0)
-       			deleteme = true;
-	   }
+	            f->unlinked = true;
+		    if (f->open_count>0)
+       			deleteme = false;
+           }
 	  if (deleteme)
 		delete e;
     return 0;
@@ -342,6 +346,40 @@ int fs_rename(const char * path,const char* npath)
     }
 }
 
+int fs_readlink (const char * path, char * buf, size_t buflen)
+{
+    string sp(path);
+    try {
+	rdlock l(fs_lock);
+        slink* e=filesystem.find_link(sp);
+	int max=min(buflen-1,e->dest.length());
+	memcpy(buf,e->dest.c_str(),max);
+	buf[max]='\0';
+	return 0;
+    } catch (int e)
+    { return e;
+    }
+
+}
+
+int fs_symlink(const char * link, const char * path)
+{
+    string sf(path);
+    try{
+    wrlock l(fs_lock);
+    int idx = sf.find_last_of('/');
+    string part  = sf.substr(0,idx);
+    folder* e = filesystem.find_folder(part);
+    string part2 = sf.substr(idx+1);
+    string ld(link);
+    slink* af = new slink(e, part2,ld);
+    stat_create(af,0777);
+    e->add(af);
+    } catch (int e)
+    { return e;
+    }
+    return 0;
+}	
 
 #ifdef TEST
 int main()
@@ -373,6 +411,8 @@ int main(int argc, char *argv[])
     fs_oper.rmdir = fs_rmdir;
     fs_oper.rename = fs_rename;
     fs_oper.release = fs_release;
+    fs_oper.readlink = fs_readlink;
+    fs_oper.symlink = fs_symlink;
 
 //	fs_oper.close=fs_close;
     return fuse_main(argc, argv, &fs_oper,NULL);

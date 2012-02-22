@@ -63,16 +63,12 @@ class file : public entry {
 
 public:
     file(folder* parent, string& name) : entry(parent,name) {
-        chmod(0444);
 	open_count=0;
         stbuf.st_nlink = 1;
     }
     file_data_t data;
     int open_count;
 
-    bool is_file() {
-        return true;
-    }
     void chmod(mode_t mode) {
         stbuf.st_mode=mode|S_IFREG;
     }
@@ -93,6 +89,19 @@ public:
                 	  return i;
 	}	
         return data.end();
+    }
+};
+
+class slink : public entry {
+	
+public:
+    string dest;
+    slink(folder* parent, string& name,string& dest_) : entry(parent,name) {
+        stbuf.st_nlink = 1;
+	dest=dest_;
+    }
+    void chmod(mode_t mode) {
+        stbuf.st_mode=mode|S_IFLNK;
     }
 };
 
@@ -154,8 +163,13 @@ public:
 	if(typeid(*e)!=typeid(file)) throw -EISDIR;
 	return static_cast<file*>(e);
     }   
+    slink* find_link(string& path) throw (int)
+    {
+	entry* e = find_entry(path);
+	if(typeid(*e)!=typeid(slink)) throw -EINVAL;
+	return static_cast<slink*>(e);
+    }   
 
     entries_t entries;
-
 };
 
