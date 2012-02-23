@@ -78,7 +78,7 @@ int fs_utimens (const char * path, const struct timespec tv[2])
     string sp(path);
     try{
     rdlock l(fs_lock);
-    file* e=filesystem.find_file(sp);
+    entry* e=filesystem.find_entry(sp);
     lock fl(e->lock);
     memcpy(&e->stbuf.st_atim,&tv[0],sizeof(struct timespec));
     memcpy(&e->stbuf.st_mtim,&tv[1],sizeof(struct timespec));
